@@ -1,0 +1,10 @@
+{
+    "id": "gitsync",
+    "name": "Git Sync",
+    "version": "0.1.0",
+    "author": "Matthew Ratcliffe",
+    "description": "Source control for engine configuration: branch indicator in the nav and a Source Control page for changes, commits, push and branch switching.",
+    "enabled": true,
+    "oie": { "apiMin": "4.6" },
+    "client": { "entry": "web/plugin.js" }
+}
