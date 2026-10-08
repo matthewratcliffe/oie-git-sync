@@ -97,7 +97,13 @@ public final class EngineConfigStore {
         /** Settings &gt; Data Pruner (the plugin's own properties). */
         DATA_PRUNER("data-pruner"),
         /** Volume Monitor rules and settings (this repository's monitoring plugin). */
-        VOLUME_MONITOR("volume-monitor");
+        VOLUME_MONITOR("volume-monitor"),
+        /**
+         * TLS Manager's local key pairs and trusted certificates, as PEM. The key pairs'
+         * private keys are written <b>unencrypted</b> -- a CA's included -- so this is
+         * opt-in, and the repository has to be guarded like the keys themselves.
+         */
+        TLS_MANAGER("tls-manager");
 
         private final String token;
 
@@ -397,7 +403,59 @@ public final class EngineConfigStore {
             result.count("volumeMonitor", monitor == null ? 0 : monitor.size());
         }
 
+        if (scope.contains(SyncScope.TLS_MANAGER)) {
+            exportTlsManager(root, result);
+        }
+
         return result;
+    }
+
+    /**
+     * tls-manager/key-pairs/*.pem and tls-manager/trusted/*.pem, one file per entry. The
+     * directories are only replaced once both keystores have been read, so an engine
+     * without TLS Manager -- or one whose keystore will not open -- leaves what the tree
+     * already holds rather than turning it into a commit deleting every certificate.
+     */
+    private static void exportTlsManager(Path root, Result result) throws IOException {
+        Map<String, TlsManagerStore.KeyPairEntry> pairs;
+        Map<String, java.security.cert.X509Certificate> trusted;
+        try {
+            pairs = TlsManagerStore.keyPairs();
+            trusted = TlsManagerStore.trusted();
+        } catch (Exception e) {
+            result.problem("tls-manager: " + describe(rootCause(e))
+                + "; its files were left as they are");
+            return;
+        }
+        Path dir = replaceDirectory(root.resolve("tls-manager"));
+        Set<String> taken = new java.util.HashSet<>();
+        for (Map.Entry<String, TlsManagerStore.KeyPairEntry> e : pairs.entrySet()) {
+            try {
+                write(dir.resolve("key-pairs").resolve(TlsManagerStore.fileName(e.getKey(), taken)),
+                    TlsManagerStore.renderKeyPair(e.getKey(), e.getValue()));
+            } catch (Exception ex) {
+                result.problem("tls-manager key pair " + e.getKey() + ": " + describe(ex));
+            }
+        }
+        taken.clear();
+        for (Map.Entry<String, java.security.cert.X509Certificate> e : trusted.entrySet()) {
+            try {
+                write(dir.resolve("trusted").resolve(TlsManagerStore.fileName(e.getKey(), taken)),
+                    TlsManagerStore.renderTrusted(e.getKey(), e.getValue()));
+            } catch (Exception ex) {
+                result.problem("tls-manager trusted certificate " + e.getKey() + ": " + describe(ex));
+            }
+        }
+        result.count("tlsKeyPairs", pairs.size());
+        result.count("tlsTrusted", trusted.size());
+    }
+
+    private static Throwable rootCause(Throwable t) {
+        Throwable c = t;
+        while (c instanceof java.lang.reflect.InvocationTargetException && c.getCause() != null) {
+            c = c.getCause();
+        }
+        return c;
     }
 
     // ------------------------------------------------------------------
@@ -598,10 +656,82 @@ public final class EngineConfigStore {
             }
         }
 
+        if (scope.contains(SyncScope.TLS_MANAGER) && Files.isDirectory(root.resolve("tls-manager"))) {
+            applyTlsManager(root.resolve("tls-manager"), result);
+        }
+
         if (!result.ok()) {
             LOG.warn("git sync applied with {} problem(s)", result.getProblems().size());
         }
         return result;
+    }
+
+    /**
+     * Upserts the tree's key pairs and trusted certificates into TLS Manager, by alias.
+     * Like the rest of apply(), it removes nothing: an entry the tree lacks is an orphan,
+     * gone only on an explicit DELETE when a branch is switched. A file that will not
+     * parse is reported and skipped, never taken as "remove this".
+     */
+    private static void applyTlsManager(Path dir, Result result) {
+        if (!TlsManagerStore.available()) {
+            result.problem("tls-manager: TLS Manager is not installed or not started; "
+                + "its certificates were not applied");
+            return;
+        }
+        Map<String, TlsManagerStore.KeyPairEntry> pairs = new LinkedHashMap<>();
+        for (Path file : pemFilesIn(dir.resolve("key-pairs"))) {
+            try {
+                String text = read(file);
+                String alias = TlsManagerStore.aliasOf(text);
+                if (alias == null) {
+                    throw new IllegalArgumentException("no '# alias:' line");
+                }
+                pairs.put(alias, TlsManagerStore.parseKeyPair(text));
+            } catch (Exception e) {
+                result.problem("tls-manager/key-pairs/" + file.getFileName() + ": " + describe(e));
+            }
+        }
+        Map<String, java.security.cert.X509Certificate> trusted = new LinkedHashMap<>();
+        for (Path file : pemFilesIn(dir.resolve("trusted"))) {
+            try {
+                String text = read(file);
+                String alias = TlsManagerStore.aliasOf(text);
+                if (alias == null) {
+                    throw new IllegalArgumentException("no '# alias:' line");
+                }
+                trusted.put(alias, TlsManagerStore.parseCertificate(text));
+            } catch (Exception e) {
+                result.problem("tls-manager/trusted/" + file.getFileName() + ": " + describe(e));
+            }
+        }
+        try {
+            TlsManagerStore.Upserted p = TlsManagerStore.upsertKeyPairs(pairs);
+            result.count("tlsKeyPairsAdded", p.added);
+            result.count("tlsKeyPairsUpdated", p.updated);
+            TlsManagerStore.Upserted t = TlsManagerStore.upsertTrusted(trusted);
+            result.count("tlsTrustedAdded", t.added);
+            result.count("tlsTrustedUpdated", t.updated);
+            if (p.added + p.updated + t.added + t.updated > 0) {
+                LOG.info("git sync applied TLS Manager: {} key pair(s) added, {} updated; "
+                    + "{} trusted certificate(s) added, {} updated",
+                    p.added, p.updated, t.added, t.updated);
+            }
+        } catch (Exception e) {
+            result.problem("tls-manager: " + describe(rootCause(e)));
+        }
+    }
+
+    private static List<Path> pemFilesIn(Path dir) {
+        if (!Files.isDirectory(dir)) {
+            return List.of();
+        }
+        try (var stream = Files.list(dir)) {
+            return stream.filter(p -> Files.isRegularFile(p) && p.toString().endsWith(".pem"))
+                .sorted().collect(Collectors.toList());
+        } catch (IOException e) {
+            LOG.error("could not list {}", dir, e);
+            return List.of();
+        }
     }
 
     /**
@@ -845,7 +975,64 @@ public final class EngineConfigStore {
             }
         }
 
+        // TLS Manager entries, by alias, under the same absent-directory rule as the
+        // types above: no tls-manager/key-pairs on the branch means it does not describe
+        // key pairs, not that every key pair -- a CA's included -- should go.
+        if (scope.contains(SyncScope.TLS_MANAGER) && TlsManagerStore.available()) {
+            if (desired.exists("tls-manager/key-pairs")) {
+                Set<String> wanted = aliasesIn(desired, "tls-manager/key-pairs");
+                try {
+                    for (String alias : TlsManagerStore.keyPairs().keySet()) {
+                        if (!wanted.contains(alias)) {
+                            orphans.add(new Orphan(SyncScope.TLS_MANAGER.token(),
+                                TLS_KEY_PAIR + alias, alias + " (TLS key pair)", false));
+                        }
+                    }
+                } catch (Exception e) {
+                    LOG.warn("could not list TLS Manager key pairs for the orphan check", e);
+                }
+            }
+            if (desired.exists("tls-manager/trusted")) {
+                Set<String> wanted = aliasesIn(desired, "tls-manager/trusted");
+                try {
+                    for (String alias : TlsManagerStore.trusted().keySet()) {
+                        if (!wanted.contains(alias)) {
+                            orphans.add(new Orphan(SyncScope.TLS_MANAGER.token(),
+                                TLS_TRUSTED + alias, alias + " (trusted certificate)", false));
+                        }
+                    }
+                } catch (Exception e) {
+                    LOG.warn("could not list TLS Manager trusted certificates for the orphan check", e);
+                }
+            }
+        }
+
         return orphans;
+    }
+
+    /** Orphan ids for TLS Manager entries: the kind, then the alias. */
+    private static final String TLS_KEY_PAIR = "key-pair:";
+    private static final String TLS_TRUSTED = "trusted:";
+
+    /**
+     * The aliases the branch's TLS Manager files name. A file whose alias line cannot be
+     * read still counts -- under its file name -- so an unreadable file is never what
+     * turns an engine entry into an orphan.
+     */
+    private static Set<String> aliasesIn(FileSource desired, String dir) {
+        Set<String> aliases = new LinkedHashSet<>();
+        for (String path : desired.list(dir)) {
+            if (!path.endsWith(".pem")) {
+                continue;
+            }
+            try {
+                String alias = TlsManagerStore.aliasOf(desired.read(path));
+                aliases.add(alias != null ? alias : path);
+            } catch (IOException e) {
+                aliases.add(path);
+            }
+        }
+        return aliases;
     }
 
     private static Set<String> idsIn(FileSource files, String dir) {
@@ -937,6 +1124,11 @@ public final class EngineConfigStore {
                 // the UI accounts for every object that was listed.
                 result.count("codeTemplatesLeft", templateIds.size());
             }
+            int tls = idsOf(orphans, SyncScope.TLS_MANAGER).size();
+            if (tls > 0) {
+                // Nor does a certificate: left as it is, and counted like the templates.
+                result.count("tlsEntriesLeft", tls);
+            }
             LOG.info("git sync disabled {} channel(s) and {} alert(s) the branch does not have",
                 channelIds.size(), alertIds.size());
             return result;
@@ -979,6 +1171,26 @@ public final class EngineConfigStore {
                 result.count("alertsDeleted", 1);
             } catch (Exception e) {
                 result.problem("removing alert " + id + ": " + describe(e));
+            }
+        }
+        List<String> tlsKeyPairs = new ArrayList<>();
+        List<String> tlsTrusted = new ArrayList<>();
+        for (String id : idsOf(orphans, SyncScope.TLS_MANAGER)) {
+            if (id.startsWith(TLS_KEY_PAIR)) {
+                tlsKeyPairs.add(id.substring(TLS_KEY_PAIR.length()));
+            } else if (id.startsWith(TLS_TRUSTED)) {
+                tlsTrusted.add(id.substring(TLS_TRUSTED.length()));
+            }
+        }
+        if (!tlsKeyPairs.isEmpty() || !tlsTrusted.isEmpty()) {
+            try {
+                int removed = TlsManagerStore.remove(tlsKeyPairs, tlsTrusted);
+                result.count("tlsEntriesDeleted", removed);
+                LOG.warn("git sync deleted {} TLS Manager entr(ies) the branch does not have: "
+                    + "key pairs {}, trusted certificates {}", removed, tlsKeyPairs, tlsTrusted);
+            } catch (Exception e) {
+                result.problem("removing TLS Manager entries this branch does not have: "
+                    + describe(rootCause(e)));
             }
         }
         // WARN rather than INFO: this destroys message history, so it should be findable in

@@ -47,7 +47,33 @@ channel-tags.xml                     Settings > Tags
 resources.xml                        Settings > Resources
 data-pruner.properties               Settings > Data Pruner
 volume-monitor.properties            Volume Monitor rules and settings
+tls-manager/key-pairs/<alias>.pem    TLS Manager key pairs: private key (UNENCRYPTED) + chain
+tls-manager/trusted/<alias>.pem      TLS Manager trusted certificates
 ```
+
+### TLS Manager certificates (`tls-manager` scope, opt-in)
+
+The key pairs and trusted certificates TLS Manager holds -- including every key
+pair generated with the Certificate Generator -- one PEM file per entry, the
+alias in a `# alias:` header line (the file name is only a slug of it).
+
+**Each key pair's private key is written unencrypted**, a CA's included. Anyone
+who can read the repository, or any commit in its history, can read the keys and
+issue certificates your partners trust. Turn the scope on only for a repository
+guarded like the keys themselves; removing a key from the tree later does not
+remove it from history.
+
+A pull upserts by alias through TLS Manager's own certificate service, so changes
+apply without a restart, and unchanged entries are left alone. It removes
+nothing: an entry the branch lacks is an orphan on a branch switch, deleted only
+when `delete` is chosen there. Export leaves the files as they are when TLS
+Manager is missing or its keystore will not open, rather than committing the
+loss of every certificate.
+
+A file written by hand only needs the `# alias:` line, an unencrypted PKCS#8
+`PRIVATE KEY` block (`openssl pkcs8 -topk8 -nocrypt`) and the certificate chain,
+leaf first. The engine rewrites it in its own form -- subject and expiry header
+lines -- on the next commit, so it shows as a change until then.
 
 The first seven are shared with `scripts/oie-config-pull.sh`. The six settings
 files are plugin-only for now — the shell scripts do not write them, so a

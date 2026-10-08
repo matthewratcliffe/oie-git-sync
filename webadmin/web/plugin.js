@@ -394,6 +394,10 @@ export function register(platform) {
         // environment (a dev instance will never see production volumes), so syncing
         // them is opt-in like the other settings pages.
         { token: 'volume-monitor', label: 'Volume Monitor rules', byDefault: false },
+        // TLS Manager's key pairs and trusted certificates. The key pairs' private
+        // keys -- a CA's included -- are written unencrypted, so anyone who can read
+        // the repository can read them; opt-in, and guard the repository accordingly.
+        { token: 'tls-manager', label: 'TLS Manager certificates (private keys unencrypted)', byDefault: false },
     ];
 
     function parseScope(value) {
